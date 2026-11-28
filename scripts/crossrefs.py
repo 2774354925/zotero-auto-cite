@@ -114,7 +114,7 @@ def _rebuild_para(p: ET.Element, new_children: list[ET.Element]):
         p.append(c)
 
 
-def process_docx(input_path: str, output_path: str) -> dict:
+def process_docx(input_path: str, output_path: str, plain: bool = False) -> dict:
     with zipfile.ZipFile(input_path, "r") as zin:
         doc_xml = zin.read("word/document.xml").decode("utf-8")
 
@@ -150,13 +150,13 @@ def process_docx(input_path: str, output_path: str) -> dict:
             kind, pid = m.group(1), m.group(2)
             info = bookmark.get(pid)
             if info:
-                _replace_caption(p, kind, info, m.end())
+                _replace_caption(p, kind, info, m.end(), plain=plain)
                 n_caption += 1
                 continue
         # 正文引用
         if "[#" not in text:
             continue
-        n_ref += _replace_refs(p, bookmark)
+        n_ref += _replace_refs(p, bookmark, plain=plain)
 
     new_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True).decode("utf-8")
     m_orig = re.search(r"<w:document\b[^>]*>", doc_xml)
@@ -178,7 +178,8 @@ def process_docx(input_path: str, output_path: str) -> dict:
     return {"captions": n_caption, "refs": n_ref, "bookmarks": bookmark}
 
 
-def _replace_caption(p: ET.Element, kind: str, info: dict, marker_end: int):
+def _replace_caption(p: ET.Element, kind: str, info: dict, marker_end: int,
+                     plain: bool = False):
     """把 [图:id] 替换成 标签 + SEQ 域 + 书签，剩余文本作为题注。"""
     rpr = _para_first_rpr(p)
     # 收集段落文本段
@@ -195,12 +196,19 @@ def _replace_caption(p: ET.Element, kind: str, info: dict, marker_end: int):
     t.text = LABEL[kind]
     new_children.append(lab_r)
 
-    # 书签 + SEQ 域
-    new_children.append(_bookmark_start(_next_bid(), info["name"]))
-    seq_instr = f"SEQ {SEQ_NAME[kind]} \\* ARABIC"
-    for e in _complex_field(seq_instr, str(info["num"]), rpr):
-        new_children.append(e)
-    new_children.append(_bookmark_end(_next_bid()))
+    if plain:
+        num_r = _make_run(rpr)
+        t = ET.SubElement(num_r, W + "t")
+        t.set(XML_SPACE, "preserve")
+        t.text = str(info["num"])
+        new_children.append(num_r)
+    else:
+        # 书签 + SEQ 域
+        new_children.append(_bookmark_start(_next_bid(), info["name"]))
+        seq_instr = f"SEQ {SEQ_NAME[kind]} \\* ARABIC"
+        for e in _complex_field(seq_instr, str(info["num"]), rpr):
+            new_children.append(e)
+        new_children.append(_bookmark_end(_next_bid()))
 
     # 题注文本前的空格（渲染为「图1 本研究…」）
     sp_r = _make_run(rpr)
@@ -257,7 +265,7 @@ def _emit_remaining(new_children, segs, marker_end, rpr):
         cur = end
 
 
-def _replace_refs(p: ET.Element, bookmark: dict) -> int:
+def _replace_refs(p: ET.Element, bookmark: dict, plain: bool = False) -> int:
     """把段落里的 [#id] 替换成 REF 域。"""
     segs = _linearize(p)
     full = "".join(s["text"] for s in segs if s["kind"] == "text")
@@ -307,10 +315,13 @@ def _replace_refs(p: ET.Element, bookmark: dict) -> int:
             if re_ <= oend:
                 info = bookmark.get(pid)
                 if info:
-                    instr = f"REF {info['name']} \\h"
                     rpr = run.find(W + "rPr")
-                    for e in _complex_field(instr, str(info["num"]), rpr):
-                        new_children.append(e)
+                    if plain:
+                        emit_text(str(info["num"]), run)
+                    else:
+                        instr = f"REF {info['name']} \\h"
+                        for e in _complex_field(instr, str(info["num"]), rpr):
+                            new_children.append(e)
                     n += 1
                 else:
                     emit_text(text[rs - ostart:re_ - ostart], run)
@@ -332,12 +343,17 @@ def main():
     args = sys.argv[1:]
     input_path = None
     output_path = None
+    plain = True
     i = 0
     while i < len(args):
         a = args[i]
         if a in ("-o", "--out"):
             i += 1
             output_path = args[i]
+        elif a == "--plain":
+            plain = True
+        elif a == "--field":
+            plain = False
         elif a in ("-h", "--help"):
             print(__doc__)
             return
@@ -349,10 +365,13 @@ def main():
         return
     input_path = Path(input_path)
     output_path = Path(output_path) if output_path else input_path.with_name(input_path.stem + "_crossref.docx")
-    result = process_docx(str(input_path), str(output_path))
+    result = process_docx(str(input_path), str(output_path), plain=plain)
     print(f"题注 {result['captions']} 处，交叉引用 {result['refs']} 处")
     print(f"写入 {output_path}")
-    print("提示：Word 中 Ctrl+A 然后 F9 刷新编号。")
+    if plain:
+        print("已写入 WPS 可直接显示的静态题注和交叉引用。")
+    else:
+        print("提示：Word 中 Ctrl+A 然后 F9 刷新编号。")
 
 
 if __name__ == "__main__":

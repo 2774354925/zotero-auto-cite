@@ -195,6 +195,19 @@ def _parse_pubmed_name(name: str) -> dict:
 
 def resolve_pmid(pmid: str) -> dict:
     pmid = pmid.strip().lower().replace("pmid:", "")
+    # efetch 比 esummary 多返回摘要，且作者/期刊元数据更完整。
+    try:
+        from pubmed_search import parse_pubmed_xml
+        xml_text = _get_text(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+            f"?db=pubmed&id={urllib.parse.quote(pmid)}&retmode=xml&rettype=abstract"
+        )
+        fetched = parse_pubmed_xml(xml_text)
+        if fetched:
+            return dict(fetched[0]["zotero_item"])
+    except Exception:
+        # 网络或 XML 变化时仍回退到 esummary。
+        pass
     data = _get_json(
         "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
         f"?db=pubmed&id={urllib.parse.quote(pmid)}&retmode=json"

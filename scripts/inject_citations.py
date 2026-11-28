@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-inject_citations.py — 把 docx 中的文献标记替换成 Zotero 活动引用域代码，
-并在文末自动追加 References 参考文献域；也可输出「纯文本预览版」（无域代码）。
+inject_citations.py — 把 docx 中的文献标记替换成 WPS 可见引文，
+或在显式使用 --field 时生成 Word/Zotero 活动引用域；并自动追加参考文献。
 
 支持的正文标记（写在 Word 正文里即可）：
     [@doi:10.1038/s41586-020-2649-2]
@@ -11,9 +11,10 @@ inject_citations.py — 把 docx 中的文献标记替换成 Zotero 活动引用
     [@doi:10.xxxx/yyyy, p. 12]          # 带定位符（页码等）
 
 两种模式：
-- field（默认）：替换为 ADDIN ZOTERO_ITEM CSL_CITATION 域 + 文末 ADDIN ZOTERO_BIBL 域，
-  供桌面 Word + Zotero 插件 Refresh 渲染；引用与库保持双向关联。
-- plain（--plain）：替换为 (Author, Year) 纯文本 + 文末纯文本参考文献表，供任意编辑器阅读。
+- field（Word 原生活引用，CLI 加 `--field`）：替换为 ADDIN ZOTERO_ITEM CSL_CITATION 域 + 文末
+  ADDIN ZOTERO_BIBL 域，供桌面 Word + Zotero 插件 Refresh 渲染。
+- plain（WPS 安全模式，CLI 默认）：替换为按目标样式预格式化的可见文本 + 逐条参考文献。
+  WPS 无法可靠执行 Zotero 的 Word 宏，因此应使用此模式。
 
 用法：
     python inject_citations.py draft.docx -o out.docx
@@ -77,9 +78,67 @@ def style_is_numeric(style: str) -> bool:
     return any(m in s for m in NUMERIC_STYLE_MARKERS)
 
 
+def _style_kind(style: str) -> str:
+    s = (style or "").lower()
+    if "gb-t-7714" in s or "gb7714" in s:
+        return "gb7714"
+    if "vancouver" in s:
+        return "vancouver"
+    if "nature" in s:
+        return "nature"
+    if "ieee" in s:
+        return "ieee"
+    if "chicago" in s:
+        return "chicago"
+    return "apa"
+
+
+def _given_initials(given: str) -> str:
+    parts = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", given or "")
+    return " ".join(f"{p[0].upper()}." for p in parts if p)
+
+
+def _author_name(author: dict, *, initials_first: bool = False) -> str:
+    family = (author.get("family") or author.get("literal")
+              or author.get("name") or "").strip()
+    given = (author.get("given") or "").strip()
+    if not family:
+        return ""
+    if not given:
+        return family
+    initials = _given_initials(given)
+    if initials_first:
+        return f"{initials} {family}".strip()
+    return f"{family}, {initials}".strip()
+
+
+def _author_names(csl: dict) -> list[str]:
+    people = csl.get("author") or csl.get("editor") or []
+    return [n for n in (_author_name(a) for a in people if isinstance(a, dict)) if n]
+
+
+def _author_names_initials_first(csl: dict) -> list[str]:
+    people = csl.get("author") or csl.get("editor") or []
+    return [n for n in (_author_name(a, initials_first=True)
+                        for a in people if isinstance(a, dict)) if n]
+
+
+def _join_authors(names: list[str], conjunction: str = ", ",
+                  max_before_et_al: int | None = None) -> str:
+    if not names:
+        return ""
+    if max_before_et_al is not None and len(names) > max_before_et_al:
+        return f"{', '.join(names[:max_before_et_al])}, et al."
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} {conjunction.strip()} {names[1]}".strip()
+    return f"{', '.join(names[:-1])}, {conjunction.strip()} {names[-1]}".strip()
+
+
 def placeholder(csl: dict, locator: str = "", num: int | None = None,
-                numeric: bool = False) -> str:
-    """Refresh 之前的可见占位文本：作者年样式 (Smith, 2020) / 数字样式 [1]。"""
+                numeric: bool = False, style: str = "apa") -> str:
+    """按目标样式生成无需域刷新也能显示的引文。"""
     if numeric and num is not None:
         if locator:
             return f"[{num}, {locator}]"
@@ -103,26 +162,128 @@ def placeholder(csl: dict, locator: str = "", num: int | None = None,
     return f"({base})"
 
 
-def bibliography_text(csl: dict) -> str:
-    """纯文本参考文献占位（近似 APA；Refresh 后由 Zotero 用所选样式重排）。"""
-    authors = csl_authors(csl)
+def bibliography_text(csl: dict, style: str = "apa") -> str:
+    """把 CSL-JSON 格式化为 WPS 可直接阅读的参考文献条目。"""
+    kind = _style_kind(style)
     year = csl_year(csl)
-    title = (csl.get("title") or "").strip()
+    title = (csl.get("title") or "").strip().rstrip(".")
     container = (csl.get("container-title") or csl.get("publicationTitle")
                  or csl.get("bookTitle") or "").strip()
     volume = (csl.get("volume") or "").strip()
     issue = (csl.get("issue") or "").strip()
     pages = (csl.get("page") or "").strip()
     doi = (csl.get("DOI") or "").strip()
+    url = (csl.get("URL") or "").strip()
+    publisher = (csl.get("publisher") or "").strip()
+    doi_url = f"https://doi.org/{doi}" if doi else ""
+
+    if kind == "gb7714":
+        names = _join_authors(_author_names_initials_first(csl),
+                              max_before_et_al=3)
+        parts = []
+        if names:
+            parts.append(names)
+        if title:
+            parts.append(f"{title}[J]")
+        tail = ""
+        if container:
+            tail += container
+        if year:
+            tail += f", {year}" if tail else year
+        if volume:
+            tail += f", {volume}"
+        if issue:
+            tail += f"({issue})"
+        if pages:
+            tail += f": {pages}"
+        if tail:
+            parts.append(tail)
+        if doi_url:
+            parts.append(f"DOI: {doi_url}")
+        return ". ".join(p.rstrip(".") for p in parts if p) + "."
+
+    if kind == "vancouver":
+        names = _join_authors(_author_names_initials_first(csl),
+                              max_before_et_al=6)
+        parts = []
+        if names:
+            parts.append(names)
+        if title:
+            parts.append(title)
+        journal_year = ""
+        if container:
+            journal_year += container
+        if year:
+            journal_year += f". {year}" if journal_year else year
+        if volume:
+            journal_year += f";{volume}"
+        if issue:
+            journal_year += f"({issue})"
+        if pages:
+            journal_year += f":{pages}"
+        if journal_year:
+            parts.append(journal_year)
+        if doi_url:
+            parts.append(f"doi:{doi}")
+        return ". ".join(p.rstrip(".") for p in parts if p) + "."
+
+    if kind == "nature":
+        names = _join_authors(_author_names(csl),
+                              max_before_et_al=5)
+        parts = []
+        if names:
+            parts.append(names)
+        if title:
+            parts.append(title)
+        journal = container
+        if volume:
+            journal += f" {volume}"
+        if pages:
+            journal += f", {pages}"
+        if year:
+            journal += f" ({year})"
+        if journal.strip():
+            parts.append(journal.strip())
+        if doi_url:
+            parts.append(doi_url)
+        return ". ".join(p.rstrip(".") for p in parts if p) + "."
+
+    if kind == "ieee":
+        names = _join_authors(_author_names_initials_first(csl),
+                              max_before_et_al=6)
+        parts = []
+        if names:
+            parts.append(names)
+        if title:
+            parts.append(f'"{title}"')
+        journal = container
+        if volume:
+            journal += f", vol. {volume}"
+        if issue:
+            journal += f", no. {issue}"
+        if pages:
+            journal += f", pp. {pages}"
+        if year:
+            journal += f", {year}"
+        if journal.strip():
+            parts.append(journal.strip())
+        if doi_url:
+            parts.append(f"doi: {doi}")
+        return ", ".join(p.rstrip(".") for p in parts if p) + "."
+
+    names = _author_names(csl)
+    if len(names) > 7:
+        author_text = ", ".join(names[:6]) + ", … " + names[-1]
+    elif len(names) > 2:
+        author_text = ", ".join(names[:-1]) + ", & " + names[-1]
+    elif len(names) == 2:
+        author_text = f"{names[0]}, & {names[1]}"
+    else:
+        author_text = names[0] if names else ""
 
     s = ""
-    if authors:
-        if len(authors) == 1:
-            s += authors[0]
-        elif len(authors) <= 7:
-            s += ", ".join(authors[:-1]) + ", & " + authors[-1]
-        else:
-            s += ", ".join(authors[:6]) + ", … " + authors[-1]
+    if author_text:
+        s += author_text
         s += " "
     if year:
         s += f"({year}). "
@@ -137,8 +298,12 @@ def bibliography_text(csl: dict) -> str:
         s += ". "
     if pages:
         s += pages.rstrip(".") + ". "
-    if doi:
-        s += f"https://doi.org/{doi}"
+    if publisher and not container:
+        s += publisher.rstrip(".") + ". "
+    if doi_url:
+        s += doi_url
+    elif url:
+        s += url
     return s.strip()
 
 
@@ -281,7 +446,7 @@ def pref_runs(style: str = "http://www.zotero.org/styles/apa",
         '</prefs></data>'
     )
     runs = []
-    for piece in ("begin", "instr", "separate", "end"):
+    for piece in ("begin", "instr", "separate", "result", "end"):
         r = ET.Element(W + "r")
         rPr = ET.SubElement(r, W + "rPr")
         ET.SubElement(rPr, W + "vanish")
@@ -295,6 +460,12 @@ def pref_runs(style: str = "http://www.zotero.org/styles/apa",
         elif piece == "separate":
             fc = ET.SubElement(r, W + "fldChar")
             fc.set(W + "fldCharType", "separate")
+        elif piece == "result":
+            # WPS 会把“没有结果的域”强制显示成域代码。放入零宽字符作为结果，
+            # 既保持 Zotero 能读取 PREF 指令，又不让 XML 出现在正文中。
+            t = ET.SubElement(r, W + "t")
+            t.set(XML_SPACE, "preserve")
+            t.text = "\u200b"
         else:
             fc = ET.SubElement(r, W + "fldChar")
             fc.set(W + "fldCharType", "end")
@@ -385,8 +556,10 @@ def replace_in_paragraph(p: ET.Element, resolve, state: dict) -> int:
                         state["cited"].append(dict(item, _num=num))
                     else:
                         num = next(it["_num"] for it in state["cited"] if it["key"] == key)
-                    formatted = placeholder(item["csl"], locator, num=num,
-                                            numeric=state["numeric"])
+                    formatted = placeholder(
+                        item["csl"], locator, num=num,
+                        numeric=state["numeric"], style=state["style"]
+                    )
                     if state["plain"]:
                         emit_text(formatted, run)
                     else:
@@ -462,7 +635,8 @@ def make_resolver(collection_key: str | None = None):
 
 
 # ---------------- 参考文献追加 ----------------
-def _append_references(root: ET.Element, items: list[dict], plain: bool):
+def _append_references(root: ET.Element, items: list[dict], plain: bool,
+                       style: str):
     body = root.find(W + "body")
     if body is None or not items:
         return
@@ -475,36 +649,45 @@ def _append_references(root: ET.Element, items: list[dict], plain: bool):
     hr = ET.SubElement(h, W + "r")
     ht = ET.SubElement(hr, W + "t")
     ht.set(XML_SPACE, "preserve")
-    ht.text = "References"
+    ht.text = "参考文献" if _style_kind(style) == "gb7714" else "References"
 
-    bp = ET.Element(W + "p")
+    bibliography_paragraphs: list[ET.Element] = []
     if plain:
         for i, item in enumerate(items):
-            if i > 0:
-                r = ET.SubElement(bp, W + "r")
-                ET.SubElement(r, W + "br")
+            bp = ET.Element(W + "p")
+            ppr = ET.SubElement(bp, W + "pPr")
+            spacing = ET.SubElement(ppr, W + "spacing")
+            spacing.set(W + "after", "120")
             r = ET.SubElement(bp, W + "r")
             t = ET.SubElement(r, W + "t")
             t.set(XML_SPACE, "preserve")
-            t.text = f"{i + 1}. {bibliography_text(item['csl'])}"
+            number = (f"[{i + 1}]" if _style_kind(style) in
+                      ("gb7714", "ieee", "nature") else f"{i + 1}.")
+            t.text = f"{number} {bibliography_text(item['csl'], style)}"
+            bibliography_paragraphs.append(bp)
     else:
-        entries = [bibliography_text(item["csl"]) for item in items]
+        entries = [bibliography_text(item["csl"], style) for item in items]
         biblio_json = build_biblio_json(items)
+        bp = ET.Element(W + "p")
         for run in biblio_field_runs(biblio_json, entries, None):
             bp.append(run)
+        bibliography_paragraphs.append(bp)
 
     if sectpr is not None:
         idx = list(body).index(sectpr)
         body.insert(idx, h)
-        body.insert(idx + 1, bp)
+        for offset, bp in enumerate(bibliography_paragraphs, start=1):
+            body.insert(idx + offset, bp)
     else:
         body.append(h)
-        body.append(bp)
+        for bp in bibliography_paragraphs:
+            body.append(bp)
 
 
 # ---------------- 主流程 ----------------
 def inject_docx(input_path: str, output_path: str, resolve, style: str,
-                plain: bool = False, biblio: bool = True) -> int:
+                plain: bool = False, biblio: bool = True,
+                include_pref: bool = True) -> int:
     with zipfile.ZipFile(input_path, "r") as zin:
         doc_xml = zin.read("word/document.xml").decode("utf-8")
 
@@ -515,6 +698,7 @@ def inject_docx(input_path: str, output_path: str, resolve, style: str,
     root = _xml_fromstring(doc_xml.encode("utf-8"))
     state = {
         "numeric": style_is_numeric(style),
+        "style": style,
         "counter": 0,
         "cited": [],
         "seen": set(),
@@ -527,11 +711,11 @@ def inject_docx(input_path: str, output_path: str, resolve, style: str,
     print(f"替换了 {n_total} 处引文")
 
     if n_total:
-        if not plain:
+        if not plain and include_pref:
             for run in pref_runs(style):
                 paras[0].insert(_first_insert_index(paras[0]), run)
         if biblio and state["cited"]:
-            _append_references(root, state["cited"], plain=plain)
+            _append_references(root, state["cited"], plain=plain, style=style)
 
     new_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True).decode("utf-8")
 
@@ -570,7 +754,7 @@ def main():
     input_path = None
     output_path = None
     style = "http://www.zotero.org/styles/apa"
-    plain = False
+    plain = True
     biblio = True
     collection_key = None
     i = 0
@@ -584,6 +768,8 @@ def main():
             style = args[i]
         elif a == "--plain":
             plain = True
+        elif a == "--field":
+            plain = False
         elif a == "--no-biblio":
             biblio = False
         elif a == "--collection":

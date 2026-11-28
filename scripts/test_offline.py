@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """离线自测：不依赖 Zotero 运行，验证 md2docx / crossrefs / inject_citations 的 XML 生成。"""
-import sys, zipfile, tempfile, os
+import sys, zipfile, tempfile, os, re
 from pathlib import Path
 
 SKILL_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -39,6 +39,15 @@ check("crossrefs 含 SEQ", "SEQ" in x)
 check("crossrefs 含 REF", "REF" in x)
 check("crossrefs 含书签", "bookmarkStart" in x)
 
+docx2_plain = tmp / "crossref_plain.docx"
+r_plain = crossrefs.process_docx(str(docx1), str(docx2_plain), plain=True)
+x_plain = read_docx_xml(docx2_plain)
+check("WPS 题注数=2", r_plain["captions"] == 2, str(r_plain["captions"]))
+check("WPS 交叉引用数=2", r_plain["refs"] == 2, str(r_plain["refs"]))
+check("WPS 不含 SEQ 域", "SEQ " not in x_plain)
+check("WPS 不含 REF 域", "REF " not in x_plain)
+check("WPS 显示图1", "图1" in "".join(re.findall(r"<w:t[^>]*>(.*?)</w:t>", x_plain)))
+
 # ---- 3. inject_citations（假解析器）----
 import inject_citations as ic
 
@@ -74,6 +83,66 @@ try:
     check("输出 docx 可重新打开", True)
 except Exception as e:
     check("输出 docx 可重新打开", False, str(e))
+
+docx5 = tmp / "cite_wps.docx"
+n5 = ic.inject_docx(
+    str(docx3), str(docx5), fake_resolve,
+    "http://www.zotero.org/styles/apa", plain=True,
+)
+x5 = read_docx_xml(docx5)
+check("WPS 引文数=2", n5 == 2, str(n5))
+check("WPS 不含 ZOTERO_ITEM", "ZOTERO_ITEM" not in x5)
+check("WPS 不含 ZOTERO_BIBL", "ZOTERO_BIBL" not in x5)
+check("WPS 含参考文献标题", "References" in x5)
+check("WPS 含 DOI", "10.1038/s41586-020-2649-2" in x5)
+try:
+    Document(str(docx5))
+    check("WPS 输出 docx 可重新打开", True)
+except Exception as e:
+    check("WPS 输出 docx 可重新打开", False, str(e))
+
+# ---- 4. PubMed XML 解析器（离线夹具）----
+import pubmed_search
+sample_pubmed = """<?xml version="1.0"?>
+<PubmedArticleSet>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID>12345678</PMID>
+      <Article>
+        <ArticleTitle>Obesity prevention in adults</ArticleTitle>
+        <Abstract>
+          <AbstractText Label="BACKGROUND">Obesity is a chronic disease.</AbstractText>
+          <AbstractText Label="RESULTS">Lifestyle intervention reduced weight.</AbstractText>
+        </Abstract>
+        <Journal>
+          <Title>Journal of Obesity</Title>
+          <ISOAbbreviation>J Obes</ISOAbbreviation>
+          <JournalIssue>
+            <PubDate><Year>2024</Year></PubDate>
+            <Volume>12</Volume><Issue>3</Issue>
+          </JournalIssue>
+        </Journal>
+        <AuthorList>
+          <Author><LastName>Smith</LastName><ForeName>Alice B.</ForeName></Author>
+        </AuthorList>
+        <Pagination><MedlinePgn>101-110</MedlinePgn></Pagination>
+        <PublicationTypeList>
+          <PublicationType>Randomized Controlled Trial</PublicationType>
+        </PublicationTypeList>
+      </Article>
+    </MedlineCitation>
+    <PubmedData>
+      <ArticleIdList>
+        <ArticleId IdType="doi">10.1000/example</ArticleId>
+      </ArticleIdList>
+    </PubmedData>
+  </PubmedArticle>
+</PubmedArticleSet>"""
+records = pubmed_search.parse_pubmed_xml(sample_pubmed)
+check("PubMed 解析 1 条", len(records) == 1, str(len(records)))
+check("PubMed 提取 PMID", records and records[0]["pmid"] == "12345678")
+check("PubMed 提取摘要", records and "Lifestyle intervention" in records[0]["abstract"])
+check("PubMed 生成引用标记", records and records[0]["citation_marker"] == "[@pmid:12345678]")
 
 print("\n全部通过" if ok else "\n存在失败")
 sys.exit(0 if ok else 1)
